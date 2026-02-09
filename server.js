@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const mysql = require('mysql2');
+const mysql = require('mysql2'); // ✅ Keep as mysql2
 const cors = require('cors');
 const path = require('path');
 
@@ -17,15 +17,22 @@ app.use(express.json({ limit: '10mb' })); // Increase from default 100kb
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 // Database connection TEST
 const db = mysql.createConnection({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    port: process.env.DB_PORT,
+    host: process.env.DB_HOST || 'database-1.ct2s4oesuriu.ap-southeast-2.rds.amazonaws.com',
+    user: process.env.DB_USER || 'admin',
+    password: process.env.DB_PASSWORD || 'uniprosg1500',
+    port: process.env.DB_PORT || 3306,
     database: process.env.DB_NAME || 'unipro_erp',
-    connectionLimit: 10,
     waitForConnections: true,
-    queueLimit: 0
+    connectionLimit: 10,
+    queueLimit: 0,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
+    connectTimeout: 60000,
+    acquireTimeout: 60000,
+    timeout: 60000
 });
+const dbPromise = db.promise();
+
 // Test database connection
 
 db.connect((err) => {
@@ -47,35 +54,27 @@ db.connect((err) => {
 
 });
 
-let pool;
 
-function createConnectionPool() {
-    if (pool) {
-        try {
-            pool.end(); // Close old pool
-        } catch (e) {
-            console.log('Error closing old pool:', e.message);
-        }
-    }
 
-    pool = mysql.createPool({
-        host: 'database-1.ct2s4oesuriu.ap-southeast-2.rds.amazonaws.com',
-        user: 'admin',
-        password: 'uniprosg1500', // உன் password
-        database: 'unipro_erp', // உன் database name
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0,
-        enableKeepAlive: true,
-        keepAliveInitialDelay: 0
-    });
 
-    console.log('✅ New connection pool created');
-    return pool;
-}
+
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'database-1.ct2s4oesuriu.ap-southeast-2.rds.amazonaws.com',
+    user: process.env.DB_USER || 'admin',
+    password: process.env.DB_PASSWORD || 'uniprosg1500',
+    database: process.env.DB_NAME || 'unipro_erp',
+    port: process.env.DB_PORT || 3306,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    enableKeepAlive: true
+});
+
+   
+
 
 // Initial creation
-createConnectionPool();
+
 
 // Pool error handling
 pool.on('error', (err) => {
@@ -85,6 +84,7 @@ pool.on('error', (err) => {
         createConnectionPool();
     }
 });
+const poolPromise = pool.promise();
 // ============= SIMPLE TEST API =============
 // Test API endpoint
 app.get('/api/test', (req, res) => {
@@ -600,48 +600,50 @@ app.get('/api/customers/table', (req, res) => {
 
     // ORDER BY clause - FIXED
     let orderClause = 'ORDER BY ';
-    switch(sortBy) {
-        case 'code':
-            // For numeric codes (0001, 0002) - sort properly
-            orderClause += 'CAST(c.customer_code AS UNSIGNED)';
-            break;
-        case 'name':
-            orderClause += 'c.customer_name';
-            break;
-        case 'created_at':
-            orderClause += 'c.created_at';
-            break;
-        case 'id':
-        default:
-            orderClause += 'c.customer_id';
-    }
+
+// Determine column
+switch(sortBy) {
+    case 'code':
+        orderClause += 'CAST(c.customer_code AS UNSIGNED)';
+        break;
+    case 'name':
+        orderClause += 'c.customer_name';
+        break;
+    case 'created_at':
+        orderClause += 'c.created_at';
+        break;
+    case 'id':
+    default:
+        orderClause += 'c.customer_id';
+}
     
     // Set sort order
-    orderClause += ` ${sortOrder.toUpperCase() === 'DESC' ? 'DESC' : 'ASC'}`;
+   orderClause += ` ${sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC'}`;
 
     // Separate queries for clarity
     const countSql = `SELECT COUNT(*) as total FROM customers c ${whereConditions}`;
     
     // ✅ CORRECTED: Only one ORDER BY clause
-    const dataSql = `
-        SELECT 
-            c.customer_id,
-            c.customer_code,
-            c.customer_name,
-            c.currency,
-            c.credit_limit,
-            COALESCE(c.credit_on_hold, 0) as credit_on_hold,
-            c.is_active,
-            c.is_blocked,
-            c.contact_person1,
-            c.phone1,
-            c.email,
-            c.salesman,
-            c.created_at
-        FROM customers c
-         -- 👈 ONLY THIS ONE
-        LIMIT ? OFFSET ?
-    `;
+  const dataSql = `
+    SELECT 
+        c.customer_id,
+        c.customer_code,
+        c.customer_name,
+        c.currency,
+        c.credit_limit,
+        COALESCE(c.credit_on_hold, 0) as credit_on_hold,
+        c.is_active,
+        c.is_blocked,
+        c.contact_person1,
+        c.phone1,
+        c.email,
+        c.salesman,
+        c.created_at
+    FROM customers c
+    ${whereConditions}
+    ${orderClause}
+    LIMIT ? OFFSET ?
+`;
 
     // For data query, add limit and offset
     const dataParams = [...params, parseInt(limit), parseInt(offset)];
@@ -13890,6 +13892,952 @@ app.delete('/api/services/:id', (req, res) => {
         });
     });
 });
+// saveInvoiceItems function add panninga - இது app.post()க்கு முன் இருக்க வேண்டும்
+function saveInvoiceItems(invoiceId, invoiceData, res) {
+    console.log(`💾 Saving ${invoiceData.items.length} items for invoice ${invoiceId}`);
+    
+    if (!invoiceData.items || invoiceData.items.length === 0) {
+        return res.json({
+            success: true,
+            data: { invoice_id: invoiceId, invoice_no: invoiceData.invoice_no }
+        });
+    }
+    
+    const itemPromises = invoiceData.items.map(item => {
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO purchase_invoice_items 
+                (invoice_id, item_type, reference_item_id, item_code, 
+                 item_name, quantity, unit_price, total_amount, uom)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `;
+            
+            const values = [
+                invoiceId,
+                item.item_type || 'product',
+                item.reference_item_id || 0,
+                item.item_code || '',
+                item.item_name || 'Item',
+                item.quantity || 1,
+                item.unit_price || 0,
+                item.total_amount || 0,
+                item.uom || 'PCS'
+            ];
+            
+            db.query(sql, values, (err, result) => {
+                if (err) reject(err);
+                else resolve(result);
+            });
+        });
+    });
+    
+    Promise.all(itemPromises)
+        .then(() => {
+            console.log(`✅ All items saved for invoice ${invoiceId}`);
+            res.json({
+                success: true,
+                data: { 
+                    invoice_id: invoiceId, 
+                    invoice_no: invoiceData.invoice_no,
+                    message: 'Invoice saved successfully'
+                }
+            });
+        })
+        .catch(error => {
+            console.error('❌ Failed to save items:', error);
+            res.status(500).json({
+                success: false,
+                error: 'Failed to save invoice items: ' + error.message
+            });
+        });
+}
+//=============Purchase Invoices API=================
+// POST /api/purchase-invoices
+app.post('/api/purchase-invoices', (req, res) => {
+    console.log('📥 Invoice save request received');
+    
+    try {
+        // Calculate payment fields
+        const paidAmount = req.body.paid_amount || 0;
+        const grandTotal = req.body.grand_total || 0;
+        const balanceAmount = req.body.balance_amount || (grandTotal - paidAmount);
+        
+        // Determine payment status
+        let paymentStatus = 'new';
+        if (paidAmount >= grandTotal) {
+            paymentStatus = 'paid';
+        } else if (paidAmount > 0) {
+            paymentStatus = 'partial';
+        }
+
+        // Extract MINIMAL required data first
+        const invoiceData = {
+            // ============ REQUIRED FIELDS ============
+            vendor_id: req.body.vendor_id || 1,
+            invoice_no: req.body.invoice_no || `INV-${Date.now()}`,
+            transaction_no: req.body.transaction_no || '',
+            invoice_date: req.body.invoice_date || new Date().toISOString().split('T')[0],
+            transaction_date: req.body.transaction_date || new Date().toISOString().split('T')[0],
+            
+            // ============ OPTIONAL FIELDS ============
+            due_date: req.body.due_date || null,
+            expected_payment_date: req.body.expected_payment_date || null,
+            currency_id: req.body.currency_id || 1,
+            currency_rate: req.body.currency_rate || 1.0000,
+            gst_type: req.body.gst_type || 'Exclusive',
+            gst_value: req.body.gst_value || 9.00,
+            terms: req.body.terms || '30 Days',
+            po_no: req.body.po_no || '',
+            reference_no: req.body.reference_no || '',
+            project_id: req.body.project_id || null,
+            add_to_project_costing: req.body.add_to_project_costing || 0,
+            discount_type: req.body.discount_type || '$',
+            discount_value: req.body.discount_value || 0,
+            discount_amount: req.body.discount_amount || 0,
+            subtotal: req.body.subtotal || 0,
+            gst_amount: req.body.gst_amount || 0,
+            fc_amount: req.body.fc_amount || 0,
+            grand_total: grandTotal,
+            status: 'draft',
+            remarks: req.body.remarks || '',
+            created_by: req.body.created_by || 1,
+            
+            // ============ NEW FIELDS ============
+            invoice_type: req.body.invoice_type || 'Invoice',
+            permit_no: req.body.permit_no || '',
+            bill_of_lading_no: req.body.bill_of_lading_no || '',
+            container_no: req.body.container_no || '',
+            profit_reference: req.body.profit_reference || '',
+            
+            // ============ PAYMENT FIELDS ============
+            payment_status: paymentStatus,
+            paid_amount: paidAmount,
+            balance_amount: balanceAmount,
+            
+            items: req.body.items || []
+        };
+        
+        console.log('🔍 Invoice data prepared:', {
+            grandTotal,
+            paidAmount,
+            balanceAmount,
+            paymentStatus
+        });
+        
+        // ============ VALIDATION ============
+        if (!invoiceData.vendor_id) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Vendor is required' 
+            });
+        }
+        
+        if (!invoiceData.items || invoiceData.items.length === 0) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'At least one item is required' 
+            });
+        }
+        
+        // ============ SIMPLIFIED SQL ============
+        const simpleSQL = `
+            INSERT INTO purchase_invoices 
+            (
+                vendor_id, invoice_no, transaction_no, 
+                invoice_date, transaction_date, due_date, expected_payment_date,
+                currency_id, currency_rate, gst_type, gst_value,
+                terms, po_no, reference_no, project_id,
+                add_to_project_costing, discount_type, discount_value,
+                subtotal, discount_amount, gst_amount, fc_amount, grand_total,
+                status, remarks, created_by, 
+                permit_no, bill_of_lading_no, container_no,
+                profit_reference, invoice_type,
+                payment_status, paid_amount, balance_amount,
+                created_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?,      -- 7 values
+                ?, ?, ?, ?,               -- 4 values
+                ?, ?, ?, ?,               -- 4 values
+                ?, ?, ?,                  -- 3 values
+                ?, ?, ?, ?, ?,            -- 5 values
+                ?, ?, ?,                  -- 3 values
+                ?, ?, ?, ?, ?,            -- 5 values
+                ?, ?, ?,                  -- 3 payment values
+                NOW()                     -- created_at
+            )
+        `;
+            
+        const simpleValues = [
+            // Vendor & Dates (7)
+            invoiceData.vendor_id,
+            invoiceData.invoice_no,
+            invoiceData.transaction_no,
+            invoiceData.invoice_date,
+            invoiceData.transaction_date,
+            invoiceData.due_date,
+            invoiceData.expected_payment_date,
+            
+            // Currency & GST (4)
+            invoiceData.currency_id,
+            invoiceData.currency_rate,
+            invoiceData.gst_type,
+            invoiceData.gst_value,
+            
+            // References (4)
+            invoiceData.terms,
+            invoiceData.po_no,
+            invoiceData.reference_no,
+            invoiceData.project_id,
+            
+            // Costing & Discount (3)
+            invoiceData.add_to_project_costing,
+            invoiceData.discount_type,
+            invoiceData.discount_value,
+            
+            // Amounts (5)
+            invoiceData.subtotal,
+            invoiceData.discount_amount,
+            invoiceData.gst_amount,
+            invoiceData.fc_amount,
+            invoiceData.grand_total,
+            
+            // Status & Info (3)
+            invoiceData.status,
+            invoiceData.remarks,
+            invoiceData.created_by,
+            
+            // Extra Fields (5)
+            invoiceData.permit_no,
+            invoiceData.bill_of_lading_no,
+            invoiceData.container_no,
+            invoiceData.profit_reference,
+            invoiceData.invoice_type,
+            
+            // Payment Fields (3)
+            invoiceData.payment_status,
+            invoiceData.paid_amount,
+            invoiceData.balance_amount
+        ];
+            
+        console.log(`🔢 Simple SQL: ${simpleValues.length} values`);
+        
+        // Execute
+        db.query(simpleSQL, simpleValues, (invoiceError, invoiceResult) => {
+            if (invoiceError) {
+                console.error('❌ Invoice insert error:', invoiceError);
+                console.error('Full SQL error:', invoiceError);
+                
+                // Try even SIMPLER insert
+                const minimalSQL = `
+                    INSERT INTO purchase_invoices 
+                    (vendor_id, invoice_no, invoice_date, transaction_date, 
+                     currency_id, status, created_by, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+                `;
+                
+                const minimalValues = [
+                    invoiceData.vendor_id,
+                    invoiceData.invoice_no,
+                    invoiceData.invoice_date,
+                    invoiceData.transaction_date,
+                    invoiceData.currency_id,
+                    'draft',
+                    invoiceData.created_by
+                ];
+                
+                db.query(minimalSQL, minimalValues, (minError, minResult) => {
+                    if (minError) {
+                        console.error('❌ Minimal insert also failed:', minError);
+                        return res.status(500).json({
+                            success: false,
+                            error: 'Failed to save invoice: ' + minError.message
+                        });
+                    }
+                    
+                    console.log(`✅ Invoice saved with minimal fields! ID: ${minResult.insertId}`);
+                    saveInvoiceItems(minResult.insertId, invoiceData, res);
+                });
+                
+            } else {
+                console.log(`✅ Invoice saved! ID: ${invoiceResult.insertId}`);
+                saveInvoiceItems(invoiceResult.insertId, invoiceData, res);
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ General error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Keep the saveInvoiceItems function same as before
+// GET /api/purchase-invoices
+app.get('/api/purchase-invoices', (req, res) => {
+    try {
+        let {
+            page = 1,
+            limit = 20,
+            search = '',
+            vendor = '',
+            status = '',
+            startDate = '',
+            endDate = '',
+            invoiceNo = ''
+        } = req.query;
+
+        // Convert to numbers
+        page = parseInt(page);
+        limit = parseInt(limit);
+        const offset = (page - 1) * limit;
+
+        console.log('📋 Fetching purchase invoices:', req.query);
+
+        // Base query
+        let sql = `
+            SELECT 
+                pi.invoice_id,
+                pi.invoice_no,
+                pi.transaction_no,
+                pi.invoice_date,
+                pi.transaction_date,
+                pi.due_date,
+                pi.status,
+                pi.payment_status,
+                pi.subtotal,
+                pi.discount_amount,
+                pi.gst_amount,
+                pi.grand_total,
+                pi.fc_amount,
+                pi.paid_amount,
+                pi.balance_amount,
+                pi.remarks,
+                pi.created_at,
+                
+                v.vendor_id,
+                v.vendor_name,
+                v.vendor_code,
+                
+                c.currency_code,
+                c.currency_symbol
+            FROM purchase_invoices pi
+            LEFT JOIN vendors v ON pi.vendor_id = v.vendor_id
+            LEFT JOIN currencies c ON pi.currency_id = c.currency_id
+            WHERE 1=1
+        `;
+
+        let countSql = `
+            SELECT COUNT(*) as total 
+            FROM purchase_invoices pi
+            WHERE 1=1
+        `;
+
+        const params = [];
+        const countParams = [];
+
+        // Apply filters
+        if (search) {
+            sql += ` AND (v.vendor_name LIKE ? OR pi.invoice_no LIKE ?)`;
+            countSql += ` AND EXISTS (
+                SELECT 1 FROM vendors v2 
+                WHERE v2.vendor_id = pi.vendor_id 
+                AND (v2.vendor_name LIKE ? OR pi.invoice_no LIKE ?)
+            )`;
+            params.push(`%${search}%`, `%${search}%`);
+            countParams.push(`%${search}%`, `%${search}%`);
+        }
+
+        if (vendor && vendor !== 'ALL') {
+            sql += ` AND pi.vendor_id = ?`;
+            countSql += ` AND pi.vendor_id = ?`;
+            params.push(vendor);
+            countParams.push(vendor);
+        }
+
+        if (status) {
+            if (status === 'overdue') {
+                sql += ` AND pi.payment_status = 'overdue'`;
+                countSql += ` AND pi.payment_status = 'overdue'`;
+            } else if (status === 'new') {
+                sql += ` AND pi.payment_status = 'new'`;
+                countSql += ` AND pi.payment_status = 'new'`;
+            } else {
+                sql += ` AND pi.status = ?`;
+                countSql += ` AND pi.status = ?`;
+                params.push(status);
+                countParams.push(status);
+            }
+        }
+
+        if (startDate) {
+            sql += ` AND pi.transaction_date >= ?`;
+            countSql += ` AND pi.transaction_date >= ?`;
+            params.push(startDate);
+            countParams.push(startDate);
+        }
+
+        if (endDate) {
+            sql += ` AND pi.transaction_date <= ?`;
+            countSql += ` AND pi.transaction_date <= ?`;
+            params.push(endDate);
+            countParams.push(endDate);
+        }
+
+        if (invoiceNo) {
+            sql += ` AND pi.invoice_no LIKE ?`;
+            countSql += ` AND pi.invoice_no LIKE ?`;
+            params.push(`%${invoiceNo}%`);
+            countParams.push(`%${invoiceNo}%`);
+        }
+
+        // Order and limit
+        sql += ` ORDER BY pi.transaction_date DESC, pi.invoice_id DESC LIMIT ? OFFSET ?`;
+        params.push(limit, offset);
+
+        console.log('SQL:', sql);
+        console.log('Params:', params);
+
+        // Execute queries in parallel
+        Promise.all([
+            new Promise((resolve, reject) => {
+                db.query(countSql, countParams, (err, result) => {
+                    if (err) reject(err);
+                    else resolve(result[0]?.total || 0);
+                });
+            }),
+            new Promise((resolve, reject) => {
+                db.query(sql, params, (err, result) => {
+                    if (err) reject(err);
+                    else resolve(result);
+                });
+            }),
+            new Promise((resolve, reject) => {
+                // Get summary
+                const summarySql = `
+                    SELECT 
+                        COUNT(*) as total_count,
+                        SUM(grand_total) as total_invoice,
+                        SUM(CASE WHEN payment_status = 'overdue' THEN balance_amount ELSE 0 END) as total_unpaid,
+                        SUM(CASE WHEN payment_status = 'paid' THEN grand_total ELSE 0 END) as total_paid,
+                        SUM(fc_amount) as total_order
+                    FROM purchase_invoices
+                    WHERE status != 'cancelled'
+                `;
+                db.query(summarySql, (err, result) => {
+                    if (err) reject(err);
+                    else resolve(result[0] || {});
+                });
+            })
+        ]).then(([total, data, summary]) => {
+            res.json({
+                success: true,
+                data: data,
+                summary: {
+                    total_order: summary.total_order || 0,
+                    total_invoice: summary.total_invoice || 0,
+                    total_unpaid: summary.total_unpaid || 0,
+                    total_paid: summary.total_paid || 0
+                },
+                pagination: {
+                    page: page,
+                    limit: limit,
+                    total: total,
+                    total_pages: Math.ceil(total / limit)
+                }
+            });
+        }).catch(error => {
+            console.error('❌ Query error:', error);
+            res.status(500).json({
+                success: false,
+                error: error.message
+            });
+        });
+
+    } catch (error) {
+        console.error('❌ Server error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+app.get('/api/vendors/active', (req, res) => {
+    try {
+        console.log('👥 Getting active vendors');
+        
+        const sql = `
+            SELECT vendor_id, vendor_code, vendor_name, email, phone 
+            FROM vendors 
+            WHERE is_active = 1 
+            ORDER BY vendor_name
+        `;
+        
+        db.query(sql, (err, result) => {
+            if (err) {
+                console.error('❌ Vendor error:', err);
+                return res.status(500).json({
+                    success: false,
+                    error: err.message
+                });
+            }
+            
+            console.log(`✅ Found ${result.length} vendors`);
+            
+            res.json({
+                success: true,
+                data: result
+            });
+        });
+        
+    } catch (error) {
+        console.error('❌ Server error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// SIMPLIFIED VERSION - TEST FIRST:
+app.get('/api/purchase-invoices/simple', (req, res) => {
+    try {
+        console.log('🧪 Simple test endpoint');
+        
+        const sql = `
+            SELECT 
+                pi.invoice_id,
+                pi.invoice_no,
+                pi.transaction_date,
+                pi.due_date,
+                pi.status,
+                pi.payment_status,
+                pi.grand_total,
+                pi.balance_amount,
+                v.vendor_name,
+                c.currency_code
+            FROM purchase_invoices pi
+            LEFT JOIN vendors v ON pi.vendor_id = v.vendor_id
+            LEFT JOIN currencies c ON pi.currency_id = c.currency_id
+            ORDER BY pi.transaction_date DESC
+            LIMIT 20
+        `;
+        
+        db.query(sql, (err, result) => {
+            if (err) {
+                console.error('❌ Simple query error:', err);
+                return res.status(500).json({
+                    success: false,
+                    error: err.message
+                });
+            }
+            
+            console.log(`✅ Simple: Found ${result.length} invoices`);
+            
+            res.json({
+                success: true,
+                data: result,
+                summary: {
+                    total_order: 0,
+                    total_invoice: 0,
+                    total_unpaid: 0,
+                    total_paid: 0
+                },
+                pagination: {
+                    page: 1,
+                    limit: 20,
+                    total: result.length,
+                    total_pages: 1
+                }
+            });
+        });
+        
+    } catch (error) {
+        console.error('❌ Simple error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+// Add these to your app.js:
+
+// GET: /api/purchase-invoices/:id - Get single invoice with items
+app.get('/api/purchase-invoices/:id', (req, res) => {
+    const invoiceId = req.params.id;
+
+    console.log(`📋 Getting purchase invoice details: ${invoiceId}`);
+
+    // Get invoice header
+    const headerSql = `
+        SELECT 
+            pi.*,
+            v.vendor_id,
+            v.vendor_code,
+            v.vendor_name,
+            v.email as vendor_email,
+           
+            v.address as vendor_address,
+            c.currency_id,
+            c.currency_code,
+            c.currency_symbol,
+            c.currency_name
+        FROM purchase_invoices pi
+        LEFT JOIN vendors v ON pi.vendor_id = v.vendor_id
+        LEFT JOIN currencies c ON pi.currency_id = c.currency_id
+        WHERE pi.invoice_id = ?
+    `;
+
+    // Get invoice items
+    const itemsSql = `
+        SELECT 
+            pii.*,
+            p.product_code,
+            p.product_name,
+            s.service_code,
+            s.service_name
+        FROM purchase_invoice_items pii
+        LEFT JOIN products p ON pii.reference_item_id = p.product_id AND pii.item_type = 'product'
+        LEFT JOIN services s ON pii.reference_item_id = s.service_id AND pii.item_type = 'service'
+        WHERE pii.invoice_id = ?
+        ORDER BY pii.item_id
+    `;
+
+    db.query(headerSql, [invoiceId], (headerErr, headerResult) => {
+        if (headerErr) {
+            console.error('❌ Header error:', headerErr);
+            return res.status(500).json({
+                success: false,
+                error: headerErr.message
+            });
+        }
+
+        if (headerResult.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Invoice not found'
+            });
+        }
+
+        const invoice = headerResult[0];
+
+        db.query(itemsSql, [invoiceId], (itemsErr, itemsResult) => {
+            if (itemsErr) {
+                console.error('❌ Items error:', itemsErr);
+                return res.status(500).json({
+                    success: false,
+                    error: itemsErr.message
+                });
+            }
+
+            res.json({
+                success: true,
+                data: {
+                    ...invoice,
+                    items: itemsResult || []
+                }
+            });
+        });
+    });
+});
+
+// PUT: /api/purchase-invoices/:id - Update invoice
+app.put('/api/purchase-invoices/:id', (req, res) => {
+    try {
+        const invoiceId = req.params.id;
+        const updateData = req.body;
+
+        console.log(`📝 Updating purchase invoice ID: ${invoiceId}`, updateData);
+
+        // Validate required fields
+        if (!updateData.vendor_id) {
+            return res.status(400).json({
+                success: false,
+                error: 'Vendor is required'
+            });
+        }
+
+        if (!updateData.invoice_date) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invoice date is required'
+            });
+        }
+
+        if (!updateData.currency_id) {
+            return res.status(400).json({
+                success: false,
+                error: 'Currency is required'
+            });
+        }
+
+        // Check if invoice exists
+        const checkSql = 'SELECT invoice_id, invoice_no FROM purchase_invoices WHERE invoice_id = ?';
+
+        db.query(checkSql, [invoiceId], (checkErr, checkResult) => {
+            if (checkErr) throw checkErr;
+
+            if (checkResult.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    error: 'Invoice not found'
+                });
+            }
+
+            const invoice = checkResult[0];
+
+            // Update invoice
+            const updateSql = 'UPDATE purchase_invoices SET ? WHERE invoice_id = ?';
+
+            const finalUpdateData = {
+                vendor_id: updateData.vendor_id,
+                invoice_date: updateData.invoice_date,
+                transaction_date: updateData.transaction_date,
+                due_date: updateData.due_date,
+                transaction_no: updateData.transaction_no,
+                currency_id: updateData.currency_id,
+                currency_rate: updateData.currency_rate,
+                status: updateData.status,
+                gst_type: updateData.gst_type,
+                po_no: updateData.po_no,
+                reference_no: updateData.reference_no,
+                remarks: updateData.remarks,
+                updated_at: new Date()
+            };
+
+            db.query(updateSql, [finalUpdateData, invoiceId], (updateErr, updateResult) => {
+                if (updateErr) {
+                    console.error('❌ Update error:', updateErr);
+                    return res.status(500).json({
+                        success: false,
+                        error: 'Database error: ' + updateErr.message
+                    });
+                }
+
+                console.log(`✅ Invoice "${invoice.invoice_no}" updated successfully`);
+
+                res.json({
+                    success: true,
+                    message: 'Invoice updated successfully',
+                    invoice_id: invoiceId,
+                    invoice_no: invoice.invoice_no
+                });
+            });
+        });
+
+    } catch (error) {
+        console.error('❌ Server error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error: ' + error.message
+        });
+    }
+});
+function getPurchaseSummary(callback) {
+    const summarySql = `
+        SELECT 
+            COUNT(*) as total_count,
+            SUM(CASE WHEN status = 'posted' THEN 1 ELSE 0 END) as posted_count,
+            SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) as paid_count,
+            SUM(CASE WHEN status = 'draft' THEN 1 ELSE 0 END) as draft_count,
+            SUM(CASE WHEN payment_status = 'overdue' THEN 1 ELSE 0 END) as overdue_count,
+            
+            SUM(grand_total) as total_invoice,
+            SUM(CASE WHEN status = 'posted' THEN grand_total ELSE 0 END) as total_posted,
+            SUM(CASE WHEN status = 'paid' THEN grand_total ELSE 0 END) as total_paid,
+            SUM(CASE WHEN payment_status = 'overdue' THEN balance_amount ELSE 0 END) as total_unpaid,
+            SUM(fc_amount) as total_order
+            
+        FROM purchase_invoices
+        WHERE status IN ('draft', 'posted', 'paid')
+    `;
+
+    db.query(summarySql, (err, result) => {
+        if (err) {
+            console.error('❌ Summary error:', err);
+            return callback(err, null);
+        }
+
+        const summary = result[0] || {};
+        
+        callback(null, {
+            total_order: summary.total_order || 0,
+            total_invoice: summary.total_invoice || 0,
+            total_unpaid: summary.total_unpaid || 0,
+            total_paid: summary.total_paid || 0,
+            counts: {
+                total: summary.total_count || 0,
+                posted: summary.posted_count || 0,
+                paid: summary.paid_count || 0,
+                draft: summary.draft_count || 0,
+                overdue: summary.overdue_count || 0
+            }
+        });
+    });
+}
+
+app.get('/api/purchase-invoices/summary', (req, res) => {
+    try {
+        res.json({
+            success: true,
+            data: {
+                total_order: 2,
+                total_invoice: 4000.00,
+                unpaid_invoice: 1500.00,
+                paid_invoice: 0.00
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+
+// Make sure your backend endpoint returns items:
+app.get('/api/purchase-invoices/:id', (req, res) => {
+    const invoiceId = req.params.id;
+
+    // Get invoice header
+    const headerSql = `
+        SELECT pi.*, v.vendor_name, v.vendor_code, c.currency_code 
+        FROM purchase_invoices pi
+        LEFT JOIN vendors v ON pi.vendor_id = v.vendor_id
+        LEFT JOIN currencies c ON pi.currency_id = c.currency_id
+        WHERE pi.invoice_id = ?
+    `;
+
+    // Get invoice items - 🔴 MAKE SURE THIS QUERY IS CORRECT
+    const itemsSql = `
+        SELECT 
+            pii.*,
+            p.product_code,
+            p.product_name,
+            s.service_code,
+            s.service_name
+        FROM purchase_invoice_items pii
+        LEFT JOIN products p ON pii.reference_item_id = p.product_id AND pii.item_type = 'product'
+        LEFT JOIN services s ON pii.reference_item_id = s.service_id AND pii.item_type = 'service'
+        WHERE pii.invoice_id = ?
+        ORDER BY pii.item_id
+    `;
+
+    db.query(headerSql, [invoiceId], (headerErr, headerResult) => {
+        if (headerErr) {
+            console.error('❌ Header error:', headerErr);
+            return res.status(500).json({
+                success: false,
+                error: headerErr.message
+            });
+        }
+
+        if (headerResult.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Invoice not found'
+            });
+        }
+
+        const invoice = headerResult[0];
+
+        // Get items
+        db.query(itemsSql, [invoiceId], (itemsErr, itemsResult) => {
+            if (itemsErr) {
+                console.error('❌ Items error:', itemsErr);
+                // Still return invoice even if items fail
+                return res.json({
+                    success: true,
+                    data: {
+                        ...invoice,
+                        items: [] // Return empty array
+                    }
+                });
+            }
+
+            res.json({
+                success: true,
+                data: {
+                    ...invoice,
+                    items: itemsResult || [] // 🔴 MAKE SURE ITEMS ARE INCLUDED
+                }
+            });
+        });
+    });
+});
+// DELETE: /api/purchase-invoices/:id - Delete invoice
+app.delete('/api/purchase-invoices/:id', (req, res) => {
+    const invoiceId = req.params.id;
+
+    console.log(`🗑️ Deleting purchase invoice: ${invoiceId}`);
+
+    // Check if invoice exists
+    const checkSql = 'SELECT invoice_no FROM purchase_invoices WHERE invoice_id = ?';
+
+    db.query(checkSql, [invoiceId], (checkErr, checkResult) => {
+        if (checkErr) {
+            return res.status(500).json({
+                success: false,
+                error: checkErr.message
+            });
+        }
+
+        if (checkResult.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Invoice not found'
+            });
+        }
+
+        const invoiceNo = checkResult[0].invoice_no;
+
+        // Check if invoice is posted or paid
+        const statusCheckSql = 'SELECT status FROM purchase_invoices WHERE invoice_id = ?';
+        
+        db.query(statusCheckSql, [invoiceId], (statusErr, statusResult) => {
+            if (statusErr) {
+                return res.status(500).json({
+                    success: false,
+                    error: statusErr.message
+                });
+            }
+
+            const status = statusResult[0]?.status;
+            
+            if (status === 'posted' || status === 'paid') {
+                return res.status(400).json({
+                    success: false,
+                    error: `Cannot delete ${status} invoice. Cancel it first.`
+                });
+            }
+
+            // Delete invoice (cascade will delete items)
+            const deleteSql = 'DELETE FROM purchase_invoices WHERE invoice_id = ?';
+
+            db.query(deleteSql, [invoiceId], (deleteErr, deleteResult) => {
+                if (deleteErr) {
+                    console.error('❌ Delete error:', deleteErr);
+                    return res.status(500).json({
+                        success: false,
+                        error: 'Delete failed: ' + deleteErr.message
+                    });
+                }
+
+                console.log(`✅ Invoice "${invoiceNo}" deleted`);
+
+                res.json({
+                    success: true,
+                    message: `Invoice "${invoiceNo}" deleted successfully`
+                });
+            });
+        });
+    });
+});
+
+// Test if backend API is working
+
 // ============= START SERVER =============
 
 app.listen(PORT, () => {
